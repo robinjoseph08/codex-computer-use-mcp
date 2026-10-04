@@ -83,6 +83,7 @@ export class DirectSessionExecutor {
 						...dependencies,
 						callTool: async (directMethod, args, options) => {
 							this.session = await (this.dependencies.createSession ?? createOfficialDirectToolSession)({
+								signal: options?.signal,
 								supportsOpenAiFormElicitation: dependencies.supportsOpenAiFormElicitation === true,
 								configPath: pathConfigFile(dependencies.stateRoot ?? defaultStateRoot()),
 							});
@@ -94,7 +95,12 @@ export class DirectSessionExecutor {
 				else this.scheduleIdleClose();
 				return response;
 			} catch (error) {
-				await this.closeSession();
+				try { await this.closeSession(); }
+				catch (cleanupError) {
+					const primary = error instanceof Error ? error : new Error(String(error));
+					const cleanup = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+					throw new AggregateError([primary, cleanup], `${primary.message}; session cleanup failed: ${cleanup.message}`);
+				}
 				throw error;
 			}
 		});

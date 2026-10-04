@@ -216,10 +216,58 @@ test("aborting Computer Use code terminates a busy worker without blocking Pi", 
 		async close() {},
 	};
 	const executor = new ComputerUseCodeExecutor(session);
-	await assert.rejects(
-		executor.execute(`await sky.list_apps(); while (true) {}`, { signal: controller.signal }),
-		/Computer Use code cancelled/,
-	);
+	const result = await executor.execute(`emit(await sky.list_apps()); while (true) {}`, { signal: controller.signal });
+	assert.equal(result.error, "Computer Use code cancelled");
+	assert.deepEqual(result.calls, ["list_apps"]);
+	assert.deepEqual(result.content, [
+		{ type: "text", text: "apps" },
+		{ type: "text", text: "Computer Use code stopped: Computer Use code cancelled" },
+	]);
+});
+
+test("pre-aborted Computer Use code reports cancellation without dispatch", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	const session = {
+		async execute() { throw new Error("cancelled code must not dispatch"); },
+		async close() {},
+	};
+	const executor = new ComputerUseCodeExecutor(session);
+	const result = await executor.execute(`await sky.list_apps();`, { signal: controller.signal });
+	assert.equal(result.error, "Computer Use code cancelled");
+	assert.deepEqual(result.calls, []);
+});
+
+test("cancellation preserves observations emitted behind an unawaited pending call", async () => {
+	const controller = new AbortController();
+	let entered!: () => void;
+	let release!: () => void;
+	const callEntered = new Promise<void>((resolve) => { entered = resolve; });
+	const session = {
+		async execute() {
+			entered();
+			await new Promise<void>((resolve) => { release = resolve; });
+			return { isError: false, content: [] };
+		},
+		async close() {},
+	};
+	const executor = new ComputerUseCodeExecutor(session);
+	try {
+		const execution = executor.execute(`sky.list_apps(); emit("observation before cancel");`, { signal: controller.signal });
+		await callEntered;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		controller.abort();
+		const result = await execution;
+		assert.equal(result.error, "Computer Use code cancelled");
+		assert.deepEqual(result.calls, ["list_apps"]);
+		assert.deepEqual(result.content, [
+			{ type: "text", text: "observation before cancel" },
+			{ type: "text", text: "Computer Use code stopped: Computer Use code cancelled" },
+		]);
+	} finally {
+		release?.();
+		await executor.close();
+	}
 });
 
 test("Computer Use code preserves emits and call history after a mid-batch failure", async () => {
@@ -331,6 +379,44 @@ test("retained sessions advertise only the caller's elicitation capability", asy
 		assert.deepEqual(advertised, [false, true]);
 	} finally {
 		await Promise.all([genericExecutor.close(), piExecutor.close()]);
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("retained-session cleanup failures preserve the thrown request failure", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "direct-session-error-test."));
+	const executor = new DirectSessionExecutor({
+		createSession: async () => ({
+			async call() { throw new Error("primary request failure"); },
+			async close() { throw new Error("cleanup failure"); },
+		}),
+	});
+	try {
+		await assert.rejects(executor.execute("get_app_state", { app: "TextEdit" }, { stateRoot: root }), (error: AggregateError) => {
+			assert.match(error.message, /primary request failure/);
+			assert.match(error.message, /cleanup failure/);
+			assert.equal(error.errors.length, 2);
+			return true;
+		});
+	} finally {
+		await executor.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("retained sessions forward startup cancellation", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "direct-session-cancellation-test."));
+	const controller = new AbortController();
+	const executor = new DirectSessionExecutor({
+		createSession: async (options) => {
+			assert.equal(options.signal, controller.signal);
+			return { async call() { return brokerResult("state"); }, async close() {} };
+		},
+	});
+	try {
+		await executor.execute("get_app_state", { app: "TextEdit" }, { stateRoot: root, signal: controller.signal });
+	} finally {
+		await executor.close();
 		await rm(root, { recursive: true, force: true });
 	}
 });

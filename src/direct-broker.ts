@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -89,6 +89,13 @@ class BrokerVerificationError extends Error {
 	}
 }
 
+class BrokerCleanupError extends Error {
+	constructor(cause: Error) {
+		super(`Official direct Computer Use broker cleanup failed: ${cause.message}`, { cause });
+		this.name = "BrokerCleanupError";
+	}
+}
+
 export class DirectBrokerCallError extends Error {
 	readonly cleanupVerified: boolean;
 	readonly directCalls: number;
@@ -123,6 +130,7 @@ export class DirectBrokerCallError extends Error {
 }
 
 interface CommandResult {
+	error?: Error;
 	status: number | null;
 	stdout?: string;
 	stderr?: string;
@@ -283,7 +291,7 @@ function buildBrokerEnv(codexHome: string, tempRoot: string): NodeJS.ProcessEnv 
 	const env: NodeJS.ProcessEnv = {
 		HOME: tempRoot,
 		CODEX_HOME: codexHome,
-		PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+		PATH: `${path.join(tempRoot, "bin")}:/usr/bin:/bin:/usr/sbin:/sbin`,
 		TMPDIR: tempRoot,
 		NO_COLOR: "1",
 		CLICOLOR: "0",
@@ -380,24 +388,50 @@ function collectDescendants(rootPid: number, processEnumeratorCommand = "/usr/bi
 	return descendants;
 }
 
-function collectProcessesWithCwd(workDir: string): Set<number> {
-	const result = spawnSync("/usr/sbin/lsof", ["-a", "-d", "cwd", "+d", workDir, "-Fp"], {
+function containsDirectory(parent: string, child: string): boolean {
+	const relative = path.relative(parent, child);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function hasRelevantLsofDiagnostics(stderr: string, workDir: string): boolean {
+	const lines = stderr.split("\n").map((line) => line.trim()).filter(Boolean);
+	if (lines.length === 0) return false;
+	let canonicalWorkDir: string;
+	try { canonicalWorkDir = realpathSync(workDir); }
+	catch { return true; }
+	for (let index = 0; index < lines.length; index += 1) {
+		const warning = lines[index].match(/^lsof: WARNING: can't stat\(\) (?:smbfs|nfs|webdav) file system (\/[^\r\n]+)$/);
+		if (!warning) return true;
+		const mount = path.resolve(warning[1]);
+		for (const target of [path.resolve(workDir), canonicalWorkDir]) {
+			if (containsDirectory(mount, target) || containsDirectory(target, mount)) return true;
+		}
+		if (lines[++index] !== "Output information may be incomplete.") return true;
+		if (/^assuming "dev=[^"]+" from mount table$/.test(lines[index + 1] ?? "")) index += 1;
+	}
+	return false;
+}
+
+/** @internal Exported for deterministic process-enumeration tests. */
+export function collectProcessesWithCwd(workDir: string, runSync?: RunSync): Set<number> {
+	const args = ["-a", "-d", "cwd", "+d", workDir, "-Fp"];
+	const result = runSync ? runSync("/usr/sbin/lsof", args) : spawnSync("/usr/sbin/lsof", args, {
 		encoding: "utf8",
 		timeout: 3000,
 	});
-	if (
-		result.error
-		|| (result.status !== 0 && result.status !== 1)
-		|| (result.status === 1 && (result.stderr ?? "").trim().length > 0)
-	) {
-		throw new ProcessEnumerationError("Could not enumerate processes owned by the private broker working directory", new Set(), result.error);
-	}
 	const pids = new Set<number>();
 	for (const line of (result.stdout ?? "").split("\n")) {
 		const match = line.match(/^p(\d+)$/);
 		if (!match) continue;
 		const pid = Number(match[1]);
 		if (Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid) pids.add(pid);
+	}
+	if (
+		result.error
+		|| (result.status !== 0 && result.status !== 1)
+		|| hasRelevantLsofDiagnostics(result.stderr ?? "", workDir)
+	) {
+		throw new ProcessEnumerationError("Could not enumerate processes owned by the private broker working directory", pids, result.error);
 	}
 	return pids;
 }
@@ -501,6 +535,7 @@ export interface OfficialDirectToolSession {
 export async function createOfficialDirectToolSession(
 	options: DirectBrokerOptions = {},
 ): Promise<OfficialDirectToolSession> {
+	if (options.signal?.aborted) throw new DirectBrokerCallError("Direct Computer Use request cancelled", true);
 	const verification = options.skipSignatureVerification
 		? { brokerVersion: "test-app-server", clientBuild: "test-client", client: undefined, codexPath: undefined }
 		: verifyOfficialDirectBroker({ configPath: options.configPath });
@@ -526,6 +561,7 @@ export async function createOfficialDirectToolSession(
 	let callActive = false;
 	let currentElicitation: DirectBrokerOptions["onElicitation"];
 	let currentElicitationCount = 0;
+	let startupAbortHandler: (() => void) | undefined;
 	const pending = new Map<string, { resolve(value: JsonValue): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
 	const rejectAll = (error: Error): void => {
 		for (const waiter of pending.values()) {
@@ -584,7 +620,7 @@ export async function createOfficialDirectToolSession(
 			} catch (error) {
 				cleanupError = error instanceof Error ? error : new Error(String(error));
 			}
-			if (cleanupError) throw new Error("Official direct Computer Use broker cleanup failed", { cause: cleanupError });
+			if (cleanupError) throw new BrokerCleanupError(cleanupError);
 			if (fatalError || modelTurnsStarted !== 0) throw fatalError ?? new BrokerVerificationError("Model-turn activity was observed during broker teardown");
 		})();
 		return closePromise;
@@ -593,11 +629,16 @@ export async function createOfficialDirectToolSession(
 	try {
 		const command = options.appServerCommand ?? verification.codexPath;
 		if (!command) throw new BrokerVerificationError("The Codex app-server was not verified");
+		const binDir = path.join(tempRoot, "bin");
+		await mkdir(binDir, { mode: 0o700 });
+		// The native client also launches codex by name. Expose only the verified executable.
+		await symlink(command, path.join(binDir, "codex"));
 		let commandArgs = options.appServerArgs;
 		if (!commandArgs) {
 			if (!verification.client) throw new BrokerVerificationError("The official Computer Use client was not verified");
 			commandArgs = buildDirectAppServerArgs(workDir, verification.client.clientPath);
 		}
+		if (options.signal?.aborted) throw new Error("Direct Computer Use request cancelled");
 		proc = spawn(command, commandArgs, {
 			cwd: workDir,
 			detached: true,
@@ -656,6 +697,12 @@ export async function createOfficialDirectToolSession(
 		};
 		const stdoutLines = createInterface({ input: proc.stdout, crlfDelay: Number.POSITIVE_INFINITY });
 		stdoutLines.on("line", processProtocolLine);
+		if (options.signal) {
+			startupAbortHandler = () => fail(new Error("Direct Computer Use request cancelled"));
+			options.signal.addEventListener("abort", startupAbortHandler, { once: true });
+			if (options.signal.aborted) startupAbortHandler();
+		}
+		if (fatalError) throw fatalError;
 
 		await request("initialize", {
 			clientInfo: { name: "pi_direct_computer_use", title: "Pi Direct Computer Use", version: PACKAGE_VERSION },
@@ -672,11 +719,15 @@ export async function createOfficialDirectToolSession(
 		try { await close(); }
 		catch (closeError) {
 			const closeFailure = closeError instanceof Error ? closeError : new Error(String(closeError));
-			if (closeFailure.message === "Official direct Computer Use broker cleanup failed") {
-				throw new DirectBrokerCallError(closeFailure.message, false, primary);
+			if (closeFailure instanceof BrokerCleanupError) {
+				throw new DirectBrokerCallError(`${primary.message}; ${closeFailure.message}`, false,
+					new AggregateError([primary, closeFailure], "Startup and cleanup both failed"),
+					{ modelTurnsStarted, ephemeralThread, brokerVersion: verification.brokerVersion, clientBuild: verification.clientBuild });
 			}
 		}
 		throw new DirectBrokerCallError(primary.message, true, primary, { modelTurnsStarted, ephemeralThread, brokerVersion: verification.brokerVersion, clientBuild: verification.clientBuild });
+	} finally {
+		if (startupAbortHandler) options.signal?.removeEventListener("abort", startupAbortHandler);
 	}
 
 	return {
@@ -748,10 +799,13 @@ export async function callOfficialDirectTool(
 		}
 	} catch (cleanupError) {
 		const closeFailure = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
-		if (closeFailure.message !== "Official direct Computer Use broker cleanup failed") {
-			throw new DirectBrokerCallError(closeFailure.message, true, closeFailure, failure instanceof DirectBrokerCallError ? failure : {});
+		const evidence = failure instanceof DirectBrokerCallError ? failure : result ? { ...result, directCalls: 1 } : {};
+		if (!(closeFailure instanceof BrokerCleanupError)) {
+			throw new DirectBrokerCallError(closeFailure.message, true, closeFailure, evidence);
 		}
-		throw new DirectBrokerCallError(closeFailure.message, false, closeFailure, failure instanceof DirectBrokerCallError ? failure : {});
+		const primary = failure instanceof Error ? failure : result?.isError ? new Error("Official Computer Use returned an error response") : undefined;
+		throw new DirectBrokerCallError(primary ? `${primary.message}; ${closeFailure.message}` : closeFailure.message, false,
+			primary ? new AggregateError([primary, closeFailure], "Request and cleanup both failed") : closeFailure, evidence);
 	}
 	if (failure) {
 		if (failure instanceof DirectBrokerCallError) {

@@ -1,6 +1,6 @@
 {
   "name": "codex-computer-use-mcp",
-  "version": "0.5.2",
+  "version": "0.5.2-rmj.1",
   "description": "Expose the official macOS Computer Use tools directly to Pi and MCP clients without a nested model.",
   "author": "Thomas Mustier",
   "license": "MIT",
@@ -72,10 +72,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tmustier/codex-computer-use-mcp.git"
+    "url": "git+https://github.com/robinjoseph08/codex-computer-use-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/tmustier/codex-computer-use-mcp/issues"
+    "url": "https://github.com/robinjoseph08/codex-computer-use-mcp/issues"
   },
-  "homepage": "https://github.com/tmustier/codex-computer-use-mcp#readme"
+  "homepage": "https://github.com/robinjoseph08/codex-computer-use-mcp#readme"
 }

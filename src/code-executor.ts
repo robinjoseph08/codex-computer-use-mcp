@@ -123,7 +123,7 @@ export class ComputerUseCodeExecutor {
 					timer = setTimeout(() => stopWithError(`execution exceeded ${this.codeSliceTimeoutMs}ms between Computer Use calls`), this.codeSliceTimeoutMs);
 					timer.unref();
 				};
-				const abort = (): void => fail(new Error("Computer Use code cancelled"));
+				const abort = (): void => stopWithError("Computer Use code cancelled");
 				if (dependencies.signal?.aborted) {
 					abort();
 					return;
@@ -131,7 +131,7 @@ export class ComputerUseCodeExecutor {
 				dependencies.signal?.addEventListener("abort", abort, { once: true });
 				let messageQueue = Promise.resolve();
 				worker.on("message", (rawMessage: WorkerMessageInput) => {
-					messageQueue = messageQueue.then(async () => {
+					const handleMessage = async (): Promise<void> => {
 						if (settled) return;
 						const message = workerMessageSchema.parse(rawMessage);
 						if (message.type === "ready") {
@@ -210,7 +210,12 @@ export class ComputerUseCodeExecutor {
 						} finally {
 							armTimer();
 						}
-					}).catch((error) => fail(error instanceof Error ? error : new Error(String(error))));
+					};
+					// Observations must not wait behind an unawaited native call that cancellation can stop.
+					const observation = rawMessage.type === "emit" || rawMessage.type === "emit_image";
+					const delivery = observation ? handleMessage() : messageQueue.then(handleMessage);
+					const handled = delivery.catch((error) => fail(error instanceof Error ? error : new Error(String(error))));
+					if (!observation) messageQueue = handled;
 				});
 				worker.once("error", (error) => fail(error));
 				worker.once("exit", (code) => {

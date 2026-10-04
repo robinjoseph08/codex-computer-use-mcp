@@ -12,6 +12,7 @@ import { z } from "zod";
 import { getDirectStatus } from "./direct-service.ts";
 import { forwardOfficialElicitationToMcpClient } from "./mcp-elicitation.ts";
 import { DirectSessionExecutor } from "./session-executor.ts";
+import { registerStdioShutdown } from "./shutdown.ts";
 import {
 	COMPUTER_USE_METHODS,
 	TOOL_INPUT_SCHEMAS,
@@ -35,8 +36,9 @@ const server = new Server(
 	{ capabilities: { tools: {} } },
 );
 const sessionExecutor = new DirectSessionExecutor({ idleTimeoutMs: 120_000 });
+const lifecycle = registerStdioShutdown(() => sessionExecutor.close());
 server.onclose = () => {
-	void sessionExecutor.close().catch(() => { process.exitCode = 1; });
+	void lifecycle.shutdown().catch(() => { process.exitCode = 1; });
 };
 
 const toolDefinitions = COMPUTER_USE_METHODS.map((method) => ({
@@ -68,9 +70,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<
 
 	try {
 		const args = z.record(z.string(), z.json()).parse(request.params.arguments ?? {});
+		const signal = AbortSignal.any([extra.signal, lifecycle.signal]);
 		const response = await sessionExecutor.execute(request.params.name, args, {
-			signal: extra.signal,
-			onElicitation: (elicitation) => forwardOfficialElicitationToMcpClient(server, elicitation, extra.signal),
+			signal,
+			onElicitation: (elicitation) => forwardOfficialElicitationToMcpClient(server, elicitation, signal),
 		});
 		const result: CallToolResult = {
 			// SAFETY: app-server returns MCP CallToolResult content blocks; the broker already verifies the JSON object envelope.

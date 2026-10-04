@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,7 +14,7 @@ async function makeFake(root: string): Promise<{ script: string; log: string }> 
 	const script = path.join(root, "fake-app-server.mjs");
 	const log = path.join(root, "requests.jsonl");
 	await writeFile(script, `
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readlinkSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 const log=${JSON.stringify(log)}; const mode=process.argv[2]||"ok";
@@ -22,13 +22,14 @@ const send=x=>process.stdout.write(JSON.stringify(x)+"\\n");
 const rl=createInterface({input:process.stdin});
 let pendingTool; let activeApp;
 if(mode==="child-hang"||mode==="orphan-exit"){const child=spawn(process.execPath,["-e","process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{detached:true,stdio:"ignore"});child.unref();appendFileSync(log,JSON.stringify({childPid:child.pid})+"\\n");if(mode==="orphan-exit")process.exit(0);}
-rl.on("line",line=>{const m=JSON.parse(line); appendFileSync(log,JSON.stringify({method:m.method,id:m.id,params:m.params,result:m.result,codexHome:process.env.CODEX_HOME,home:process.env.HOME,tmpdir:process.env.TMPDIR,hasOpenAIKey:Boolean(process.env.OPENAI_API_KEY)})+"\\n");
- if(m.method==="initialize") return send({id:m.id,result:{userAgent:"fake",platformFamily:"unix",platformOs:"macos"}});
+rl.on("line",line=>{const m=JSON.parse(line); appendFileSync(log,JSON.stringify({method:m.method,id:m.id,params:m.params,result:m.result,codexHome:process.env.CODEX_HOME,home:process.env.HOME,tmpdir:process.env.TMPDIR,brokerPath:process.env.PATH,codexLink:existsSync(process.env.HOME+"/bin/codex")?readlinkSync(process.env.HOME+"/bin/codex"):null,hasOpenAIKey:Boolean(process.env.OPENAI_API_KEY)})+"\\n");
+ if(m.method==="initialize"){if(mode==="startup-hang")return;return send({id:m.id,result:{userAgent:"fake",platformFamily:"unix",platformOs:"macos"}});}
  if(m.method==="initialized") return;
  if(m.method==="thread/start"){send({id:m.id,result:{thread:{id:"thread-test"}}}); if(mode==="model-event")send({method:"turn/started",params:{}}); return;}
  if(m.method==="mcpServer/tool/call"){
    if(mode==="close-before-tool"){process.stdin.destroy();setTimeout(()=>process.exit(0),100);return;}
    if(mode==="hang"||mode==="child-hang") return;
+   if(mode==="request-error")return send({id:m.id,error:{message:"fixture request failed"}});
    if(mode==="lease"){
      if(m.params.tool==="get_app_state") activeApp=m.params.arguments.app;
      else if(activeApp!==m.params.arguments.app) return send({id:m.id,result:{content:[{type:"text",text:"Computer Use is not active"}],isError:true}});
@@ -97,8 +98,48 @@ test("direct broker uses only zero-turn app-server MCP methods and an isolated c
 		assert.ok(records.every((item) => z.string().safeParse(item.codexHome).success && item.codexHome.includes("pi-direct-computer-use.")));
 		assert.ok(records.every((item) => item.home.includes("pi-direct-computer-use.") && item.tmpdir === item.home));
 		assert.ok(records.every((item) => !item.codexHome.includes(path.join(os.homedir(), ".codex"))));
+		assert.ok(records.every((item) => item.brokerPath === `${item.home}/bin:/usr/bin:/bin:/usr/sbin:/sbin`));
+		assert.ok(records.every((item) => item.codexLink === process.execPath));
 	} finally {
 		if (previousKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousKey;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("pre-aborted broker startup does not spawn a process", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "direct-broker-pre-abort-test."));
+	let session: Awaited<ReturnType<typeof createOfficialDirectToolSession>> | undefined;
+	try {
+		const { script } = await makeFake(root);
+		const controller = new AbortController();
+		controller.abort();
+		let spawned = false;
+		await assert.rejects(async () => {
+			session = await createOfficialDirectToolSession({ ...options(script), signal: controller.signal, onSpawn: () => { spawned = true; } });
+		}, /cancelled/);
+		assert.equal(spawned, false);
+	} finally {
+		await session?.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("cancellation during broker initialization terminates and removes private state", { timeout: 5_000 }, async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "direct-broker-startup-abort-test."));
+	let pid = 0;
+	try {
+		const { script, log } = await makeFake(root);
+		const controller = new AbortController();
+		const call = createOfficialDirectToolSession({
+			...options(script, "startup-hang"), signal: controller.signal,
+			onSpawn: (value) => { pid = value; setTimeout(() => controller.abort(), 100); },
+		});
+		await assert.rejects(call, /cancelled/);
+		assert.throws(() => process.kill(pid, 0));
+		const record = JSON.parse((await readFile(log, "utf8")).trim().split("\n")[0]);
+		await assert.rejects(stat(record.home), { code: "ENOENT" });
+	} finally {
+		if (pid > 1) try { process.kill(pid, "SIGKILL"); } catch { /* already cleaned */ }
 		await rm(root, { recursive: true, force: true });
 	}
 });
@@ -136,6 +177,22 @@ test("one-shot wrapper preserves a setup-phase cleanup failure", async () => {
 		}
 		assert.match(observed?.message ?? "", /cleanup failed/);
 		assert.equal(observed?.cleanupVerified, false);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("cleanup errors retain the primary request failure and enumeration reason", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "direct-broker-error-detail-test."));
+	try {
+		const { script } = await makeFake(root);
+		await assert.rejects(callOfficialDirectTool("list_apps", {}, {
+			...options(script, "request-error"), processEnumeratorCommand: path.join(root, "missing-enumerator"),
+		}), (error: DirectBrokerCallError) => {
+			assert.match(error.message, /fixture request failed/);
+			assert.match(error.message, /cleanup failed: Could not enumerate/);
+			assert.equal(error.cleanupVerified, false);
+			assert.ok(error.cause instanceof AggregateError);
+			return true;
+		});
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 

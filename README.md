@@ -4,6 +4,27 @@ Expose OpenAI's official signed macOS Computer Use tools directly to Pi and MCP 
 
 OpenAI does not produce or endorse this independent project. It relies on an experimental app-server API and installed ChatGPT components that may change.
 
+## Robin's fork
+
+This is a focused fork of [tmustier/codex-computer-use-mcp](https://github.com/tmustier/codex-computer-use-mcp), version `0.5.2-rmj.1`.
+
+- The isolated broker's `PATH` includes a private `codex` link to the signature-verified executable. The native client can find Codex without inheriting the user's credentials or executable search path.
+- Cleanup accepts recognized `lsof` stat warnings about unrelated SMB, NFS, or WebDAV mounts. Warnings involving the private working directory and all unknown diagnostics still fail closed. Backups can stay connected.
+- Cancellation stops broker startup and returns partial Pi observations and attempted-call history.
+- Standalone MCP shutdown aborts in-flight work and waits for session cleanup on stdin disconnect, SIGINT, and SIGTERM. Forced SIGKILL cannot run cleanup.
+- Cleanup failures report their reason and retain thrown request failures.
+
+The official input methods, native app selection, session retention, and platform permissions are unchanged. This fork does not add foreground automation or promise that every native app supports background input.
+
+Build this checkout using the locked dependency setup under Development, then replace the upstream Pi package with the local checkout:
+
+```bash
+pi remove npm:codex-computer-use-mcp
+pi install /absolute/path/to/codex-computer-use-mcp
+```
+
+Run `/reload` in an existing Pi session. The local package requires a built `dist/` directory; installing the Git URL alone is not sufficient. To switch back, remove the local package and reinstall the upstream npm package.
+
 ## Requirements
 
 - macOS with an unlocked user session
@@ -16,7 +37,7 @@ macOS Screen Recording, Accessibility and TCC controls still apply.
 
 ## Pi
 
-Install from npm:
+The upstream release is available from npm:
 
 ```bash
 pi install npm:codex-computer-use-mcp
